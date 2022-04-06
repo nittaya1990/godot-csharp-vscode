@@ -1,12 +1,16 @@
 import * as vscode from 'vscode';
-import { DebugProtocol } from 'vscode-debugprotocol';
 import { Client, Peer, MessageContent, MessageStatus, ILogger, IMessageHandler } from './godot-tools-messaging/client';
 import * as completion_provider from './completion-provider';
+import * as debug_provider from './debug-provider';
+import * as assets_provider from './assets-provider';
+import { getWorkspaceScenes } from './workspace-utils';
 import { fixPathForGodot } from './godot-utils';
-import * as path from 'path';
-import * as fs from 'fs';
+import { findProjectFiles, ProjectLocation, promptForProject } from './project-select';
 
-let client: Client;
+export let client: Client;
+let codeCompletionProvider: vscode.Disposable;
+let debugConfigProvider: vscode.Disposable;
+let statusBarItem: vscode.StatusBarItem;
 
 class Logger implements ILogger {
 	logDebug(message: string): void {
@@ -86,102 +90,92 @@ class MessageHandler implements IMessageHandler {
 	}
 }
 
-export function activate(context: vscode.ExtensionContext) {
-	let godotProjectDir = vscode.workspace.workspaceFolders?.find((workspaceFolder) => {
-		let rootPath = workspaceFolder.uri.fsPath;
-		let godotProjectFile = path.join(rootPath, 'project.godot');
-
-		return fs.existsSync(godotProjectFile);
-	})?.uri.fsPath;
-
-	if (godotProjectDir === undefined) {
+export async function activate(context: vscode.ExtensionContext) {
+	const foundProjects: ProjectLocation[] = await findProjectFiles();
+	// No project.godot files found. The extension doesn't need to do anything more.
+	if (foundProjects.length === 0) {
 		return;
 	}
 
-	godotProjectDir = fixPathForGodot(godotProjectDir);
+	// Setup the status bar / project selector and prompt for project if necessary
+	const commandId = 'godot.csharp.selectProject';
+	statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+	statusBarItem.command = commandId;
+	statusBarItem.show();
+	context.subscriptions.push(statusBarItem);
+	context.subscriptions.push(vscode.commands.registerCommand(commandId, async () => {
+		const project = await promptForProject(); // project.godot
+		if (project !== undefined) {
+			setupProject(project, context);
+		}
+	}));
 
-	client = new Client('VisualStudioCode', godotProjectDir, new MessageHandler(), new Logger());
+	// One project.godot files found. Use it.
+	if (foundProjects.length === 1) {
+		setupProject(foundProjects[0], context);
+	}
+	// Multiple project.godot files found. Prompt the user for which one they want to use.
+	else {
+		const project = await promptForProject();
+		if (project !== undefined) {
+			setupProject(project, context);
+		}
+	}
+
+	// Setup generate assets command
+	const generateAssetsCommand = vscode.commands.registerCommand('godot.csharp.generateAssets', async () => {
+		await assets_provider.addAssets();
+	});
+	context.subscriptions.push(generateAssetsCommand);
+
+	// Setup get launch scene command
+	const getLaunchSceneCommand = vscode.commands.registerCommand('godot.csharp.getLaunchScene', () => {
+		return vscode.window.showQuickPick(getWorkspaceScenes(client?.getGodotProjectDir()));
+	});
+	context.subscriptions.push(getLaunchSceneCommand);
+}
+
+function setupProject(project: ProjectLocation, context: vscode.ExtensionContext) {
+	const statusBarPath: string = project.relativeProjectPath === '.' ? './' : project.relativeProjectPath;
+	statusBarItem.text = `$(folder) Godot Project: ${statusBarPath}`;
+	// Setup client
+	if (client !== undefined) {
+		client.dispose();
+	}
+	client = new Client(
+		'VisualStudioCode',
+		fixPathForGodot(project.absoluteProjectPath),
+		new MessageHandler(),
+		new Logger(),
+	);
 	client.start();
 
-	const debugConfigProvider = vscode.debug.registerDebugConfigurationProvider(
+	// Setup debug provider
+	if (debugConfigProvider !== undefined) {
+		debugConfigProvider.dispose();
+	}
+	debugConfigProvider = vscode.debug.registerDebugConfigurationProvider(
 		'godot-mono',
-		new GodotMonoDebugConfigProvider()
+		new debug_provider.GodotMonoDebugConfigProvider(project.absoluteProjectPath)
 	);
+	context.subscriptions.push(debugConfigProvider);
 
+	// Setup completion provider
 	// There's no way to extend OmniSharp without having to provide our own language server.
 	// That will be a big task so for now we will provide this basic completion provider.
-	const codeCompletionProvider = vscode.languages.registerCompletionItemProvider(
+	if (codeCompletionProvider !== undefined) {
+		codeCompletionProvider.dispose();
+	}
+	// Create client, create provider, register and subscribe provider
+	codeCompletionProvider = vscode.languages.registerCompletionItemProvider(
 		'csharp', new completion_provider.GodotCompletionProvider(client),
 		// Trigger characters
 		'(', '"', ',', ' '
 	);
-
-	context.subscriptions.push(
-		debugConfigProvider,
-		codeCompletionProvider
-	);
+	context.subscriptions.push(codeCompletionProvider);
 }
 
 export function deactivate() {
 	client.dispose();
 }
 
-class GodotMonoDebugConfigProvider implements vscode.DebugConfigurationProvider {
-	public async resolveDebugConfiguration(
-		folder: vscode.WorkspaceFolder | undefined,
-		debugConfiguration: vscode.DebugConfiguration,
-		token?: vscode.CancellationToken
-	): Promise<vscode.DebugConfiguration | undefined> {
-		if (!debugConfiguration.__exceptionOptions) {
-			debugConfiguration.__exceptionOptions = convertToExceptionOptions(getModel());
-		}
-
-		if (folder !== undefined) {
-			debugConfiguration['godotProjectDir'] = folder.uri.fsPath;
-		}
-
-		return debugConfiguration;
-	}
-}
-
-// Too lazy so we're re-using mono-debug extension settings for now...
-const configuration = vscode.workspace.getConfiguration('mono-debug');
-
-type ExceptionConfigurations = { [exception: string]: DebugProtocol.ExceptionBreakMode; };
-
-const DEFAULT_EXCEPTIONS: ExceptionConfigurations = {
-	'System.Exception': 'never',
-	'System.SystemException': 'never',
-	'System.ArithmeticException': 'never',
-	'System.ArrayTypeMismatchException': 'never',
-	'System.DivideByZeroException': 'never',
-	'System.IndexOutOfRangeException': 'never',
-	'System.InvalidCastException': 'never',
-	'System.NullReferenceException': 'never',
-	'System.OutOfMemoryException': 'never',
-	'System.OverflowException': 'never',
-	'System.StackOverflowException': 'never',
-	'System.TypeInitializationException': 'never'
-};
-
-function getModel(): ExceptionConfigurations {
-	let model = DEFAULT_EXCEPTIONS;
-	if (configuration) {
-		const exceptionOptions = configuration.get('exceptionOptions');
-		if (exceptionOptions) {
-			model = <ExceptionConfigurations>exceptionOptions;
-		}
-	}
-	return model;
-}
-
-function convertToExceptionOptions(model: ExceptionConfigurations): DebugProtocol.ExceptionOptions[] {
-	const exceptionItems: DebugProtocol.ExceptionOptions[] = [];
-	for (let exception in model) {
-		exceptionItems.push({
-			path: [{ names: [exception] }],
-			breakMode: model[exception]
-		});
-	}
-	return exceptionItems;
-}
